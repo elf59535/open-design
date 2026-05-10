@@ -1,13 +1,18 @@
 // Client-side export helpers used by the Share menu in the HTML viewer.
-// Three of the four formats run entirely in the browser:
+// Four of the five formats run entirely in the browser:
 //   - PDF  : open the artifact in a popup window and trigger window.print().
 //            The user picks "Save as PDF" from the system print dialog.
 //   - HTML : download the artifact as a single .html file via a Blob URL.
 //   - ZIP  : pack the artifact into a stored-mode ZIP (see ./zip.ts).
+//   - MD   : download the artifact's source verbatim with a `.md` extension
+//            so it can be ingested by markdown-aware tooling (LLM context
+//            windows, vault apps, etc.). No conversion is performed — the
+//            file content is the same source the Source view shows. See
+//            issue #279.
 // PPTX export is fundamentally different — it asks the agent to convert the
 // artifact server-side, so it lives in ProjectView.tsx (not here).
 
-import { buildSrcdoc } from './srcdoc';
+import { buildSrcdoc, type SrcdocOptions } from './srcdoc';
 import { buildReactComponentSrcdoc } from './react-component';
 import { buildZip } from './zip';
 
@@ -51,6 +56,46 @@ export function exportAsZip(html: string, title: string): void {
   triggerDownload(blob, `${slug}.zip`);
 }
 
+export function exportAsMd(source: string, title: string): void {
+  // Pass-through download: the file body is the artifact source verbatim,
+  // only the extension and Content-Type are flipped to markdown. No
+  // HTML→markdown conversion happens here — users who pipe the file into
+  // markdown-aware tooling (LLM context windows, vault apps) get the same
+  // bytes the Source view displays.
+  const blob = new Blob([source], { type: 'text/markdown;charset=utf-8' });
+  triggerDownload(blob, `${safeFilename(title, 'artifact')}.md`);
+}
+
+export type ProjectPdfExportResult = 'desktop' | 'fallback';
+
+export async function exportProjectAsPdf(opts: {
+  deck: boolean;
+  fallbackPdf: () => void;
+  filePath: string;
+  projectId: string;
+  title: string;
+}): Promise<ProjectPdfExportResult> {
+  try {
+    const resp = await fetch(`/api/projects/${encodeURIComponent(opts.projectId)}/export/pdf`, {
+      body: JSON.stringify({
+        deck: opts.deck,
+        fileName: opts.filePath,
+        title: opts.title,
+      }),
+      headers: { 'content-type': 'application/json' },
+      method: 'POST',
+    });
+    if (!resp.ok) throw new Error(`desktop PDF export unavailable (${resp.status})`);
+    const body = await resp.json().catch(() => ({}));
+    if (body && body.ok === false) throw new Error(body.error || 'desktop PDF export failed');
+    return 'desktop';
+  } catch (err) {
+    console.warn('[exportProjectAsPdf] falling back to browser print:', err);
+    opts.fallbackPdf();
+    return 'fallback';
+  }
+}
+
 type ReactSourceExtension = '.jsx' | '.tsx';
 
 export function exportAsJsx(
@@ -84,6 +129,112 @@ export function exportReactComponentAsZip(
   triggerDownload(blob, `${slug}.zip`);
 }
 
+// Project ZIP export — asks the daemon to bundle the on-disk project tree.
+// Used by FileViewer's share menu so the user gets the full uploaded
+// project (e.g. the `ui-design/` folder with its subdirs and assets) rather
+// than just a srcdoc snapshot of the rendered HTML. `filePath` is the
+// active file's project-relative path; if it lives inside a top-level
+// directory we scope the archive to that directory, otherwise we ask the
+// daemon for the whole project. Falls back to the in-memory single-file
+// ZIP on any failure so the action never silently no-ops.
+export async function exportProjectAsZip(opts: {
+  projectId: string;
+  filePath: string;
+  fallbackHtml: string;
+  fallbackTitle: string;
+}): Promise<void> {
+  const root = archiveRootFromFilePath(opts.filePath);
+  const url = `/api/projects/${encodeURIComponent(opts.projectId)}/archive${
+    root ? `?root=${encodeURIComponent(root)}` : ''
+  }`;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`archive request failed (${resp.status})`);
+    const blob = await resp.blob();
+    triggerDownload(blob, archiveFilenameFrom(resp, opts.fallbackTitle, root));
+  } catch (err) {
+    console.warn('[exportProjectAsZip] falling back to single-file ZIP:', err);
+    exportAsZip(opts.fallbackHtml, opts.fallbackTitle);
+  }
+}
+
+// Exported for unit tests. Pure string transform with no DOM dependency.
+export function archiveRootFromFilePath(filePath: string): string {
+  const trimmed = (filePath || '').replace(/^\/+/, '');
+  const slash = trimmed.indexOf('/');
+  if (slash <= 0) return '';
+  return trimmed.slice(0, slash);
+}
+
+// Exported for unit tests so the Content-Disposition fallback chain
+// (UTF-8 → legacy quoted → local slug) can be exercised against mock
+// Response objects without spinning up the daemon.
+export function archiveFilenameFrom(resp: Response, fallbackTitle: string, root: string): string {
+  // Honor the daemon's Content-Disposition (it knows the project name and
+  // handles RFC 5987 UTF-8 encoding). Fall back to the active directory
+  // name, then to the active file title.
+  const header = resp.headers.get('content-disposition') || '';
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (star && star[1]) {
+    try {
+      return decodeURIComponent(star[1]);
+    } catch {
+      // fall through to the legacy filename= or local fallback
+    }
+  }
+  const plain = /filename="([^"]+)"/i.exec(header);
+  if (plain && plain[1]) return plain[1];
+  const slug = safeFilename(root || fallbackTitle, 'project');
+  return `${slug}.zip`;
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Blob documents inherit the origin of the page that created them. For
+// generated preview HTML, opening the artifact itself as the top-level Blob
+// document would bypass the preview contract documented in
+// docs/architecture.md: the untrusted code must run in an iframe sandbox
+// without `allow-same-origin`. This wrapper is same-origin, but it contains no
+// generated script; the generated document lives in an opaque-origin child.
+export function buildSandboxedPreviewDocument(
+  doc: string,
+  title: string,
+  opts?: { allowModals?: boolean },
+): string {
+  const safeTitle = escapeHtmlAttribute(title || 'Preview');
+  const sandbox = opts?.allowModals ? 'allow-scripts allow-modals' : 'allow-scripts';
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${safeTitle}</title>
+  <style>html,body,iframe{margin:0;width:100%;height:100%;border:0}body{overflow:hidden;background:#fff}</style>
+</head>
+<body>
+  <iframe title="${safeTitle}" sandbox="${sandbox}" srcdoc="${escapeHtmlAttribute(doc)}"></iframe>
+</body>
+</html>`;
+}
+
+export function openSandboxedPreviewInNewTab(
+  html: string,
+  title: string,
+  srcdocOptions?: SrcdocOptions,
+): void {
+  const doc = buildSandboxedPreviewDocument(buildSrcdoc(html, srcdocOptions), title);
+  const blob = new Blob([doc], { type: 'text/html;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  window.open(url, '_blank', 'noopener,noreferrer');
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 // Open the artifact in a new tab via a Blob URL with a self-printing
 // script injected. Going through a Blob URL (rather than `window.open('')`
 // + `document.write`) avoids two failure modes we hit before:
@@ -99,23 +250,81 @@ export function exportReactComponentAsZip(
 // equivalent print rules; this is a safety net for older / partially
 // regenerated decks where the framework was stripped — without it,
 // horizontal-snap decks print only the visible slide.
-export function exportAsPdf(
+export async function exportAsPdf(
   html: string,
   title: string,
-  opts?: { deck?: boolean },
-): void {
-  let doc = buildSrcdoc(html);
+  opts?: SrcdocOptions & { sandboxedPreview?: boolean },
+): Promise<void> {
+  const sandboxedPreview = opts?.sandboxedPreview ?? true;
+  // Generate a per-export nonce so the print-ready handshake is resistant to
+  // spoofing by untrusted scripts inside the exported artifact.
+  const nonce = crypto.randomUUID();
+  let doc = buildSrcdoc(html, opts);
   if (opts?.deck) doc = injectDeckPrintStylesheet(doc);
+  doc = injectPrintReadyHandshake(doc, nonce);
+
+  // Desktop native print bridge — uses Electron's webContents.print() API
+  // instead of window.open + window.print(). The sandboxed wrapper omits
+  // allow-modals here because the native flow doesn't call window.print();
+  // granting it would let untrusted artifact code call alert()/confirm()
+  // and stall the hidden Electron window indefinitely.
+  const desktopApi =
+    typeof window !== 'undefined'
+      ? (window as unknown as Record<string, unknown>).__odDesktop as
+          | { printPdf?: (html: string, nonce?: string) => Promise<void>; isDesktop?: boolean }
+          | undefined
+      : undefined;
+  if (desktopApi?.printPdf) {
+    if (sandboxedPreview) {
+      doc = buildSandboxedPreviewDocument(doc, title);
+    }
+    doc = injectParentPrintReadyCache(doc, nonce);
+    try {
+      await desktopApi.printPdf(doc, nonce);
+    } catch {
+      if (typeof alert !== 'undefined') {
+        alert('Print failed. Please try Export PDF again or use the browser version.');
+      }
+    }
+    return;
+  }
+
+  // Browser fallback: wrap with allow-modals so the injected script can
+  // call window.print(), then inject the self-printing script and open a
+  // popup.
+  if (sandboxedPreview) {
+    doc = buildSandboxedPreviewDocument(doc, title, { allowModals: true });
+    doc = injectParentPrintReadyCache(doc, nonce);
+  }
   doc = injectPrintScript(doc, title);
+
   const blob = new Blob([doc], { type: 'text/html;charset=utf-8' });
   const url = URL.createObjectURL(blob);
-  const win = window.open(url, '_blank');
+
+  // Open an empty tab synchronously (without noopener) to reliably detect popup blocking.
+  // Since window.open with 'noopener' returns null on success by specification,
+  // this approach allows us to distinguish between a successful export and a blocked popup.
+  const win = window.open('', '_blank');
+
   if (!win) {
-    // Popup blocked — at least the tab navigation may have happened above.
-    // Nothing else we can do without a fresh user gesture.
+    if (typeof alert !== 'undefined') {
+      alert('Popup blocked! Click the popup-blocked icon in your browser address bar (or browser menu), choose "Always allow pop-ups" for this site, then retry Export PDF.');
+    }
+    URL.revokeObjectURL(url);
+    return;
   }
-  // Revoke later — the loaded document keeps a reference until the tab
-  // closes; revoking the URL string only removes the lookup name.
+
+  if (sandboxedPreview) {
+    try {
+      win.opener = null;
+    } catch (e) {
+      // Guard against potential context environment restrictions
+    }
+  }
+
+  // Navigate the verified window to the generated Blob URL then release
+  // the Blob URL after the tab has had time to start loading it.
+  win.location.href = url;
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
@@ -128,6 +337,28 @@ function injectPrintScript(doc: string, title: string): string {
   if (/<\/head>/i.test(doc)) return doc.replace(/<\/head>/i, `${script}</head>`);
   if (/<\/body>/i.test(doc)) return doc.replace(/<\/body>/i, `${script}</body>`);
   return doc + script;
+}
+
+function injectPrintReadyHandshake(doc: string, nonce: string): string {
+  // Wait for fonts, the window load event (which covers initial images), and
+  // any images that are still loading after load fires (dynamically added or
+  // slow images that weren't complete by the time this script ran). This
+  // mirrors the safety of the legacy waitForPrintableContent() helper and
+  // prevents image-heavy exports from printing with blank images.
+  //
+  // The nonce is a per-export random UUID that verifies the readiness signal
+  // came from our injected handshake, not a spoofed message from untrusted
+  // artifact code.
+  const script = `<script data-od-print-ready>(function(){Promise.all([document.fonts&&document.fonts.ready?document.fonts.ready.catch(function(){}):Promise.resolve(),new Promise(function(r){if(document.readyState==='complete')r();else window.addEventListener('load',r,{once:true})})]).then(function(){var imgs=Array.from(document.images).filter(function(img){return !img.complete});return Promise.all(imgs.map(function(img){return new Promise(function(r){img.addEventListener('load',r,{once:true});img.addEventListener('error',r,{once:true});if(img.complete)r()})}))}).then(function(){window.parent.postMessage({type:'OD_PRINT_READY',nonce:'${nonce}'},'*')})})();<\/script>`;
+  if (/<\/head>/i.test(doc)) return doc.replace(/<\/head>/i, `${script}</head>`);
+  if (/<\/body>/i.test(doc)) return doc.replace(/<\/body>/i, `${script}</body>`);
+  return doc + script;
+}
+
+function injectParentPrintReadyCache(doc: string, nonce: string): string {
+  const script = `<script>window.__odPrintReady=false;window.addEventListener('message',function(e){if(e.data&&e.data.type==='OD_PRINT_READY'&&e.data.nonce==='${nonce}'&&(e.source===window||(window.frames&&e.source===window.frames[0])))window.__odPrintReady=true});<\/script>`;
+  if (/<head>/i.test(doc)) return doc.replace(/<head>/i, `<head>${script}`);
+  return script + doc;
 }
 
 // Stitches every .slide into a vertical multi-page PDF: 1920×1080 per page,

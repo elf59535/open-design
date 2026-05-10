@@ -4,7 +4,7 @@ Thanks for thinking about contributing. OD is small on purpose — most of the v
 
 This guide tells you exactly where to look for each type of contribution and what bar a PR has to clear before we merge it.
 
-<p align="center"><b>English</b> · <a href="CONTRIBUTING.de.md">Deutsch</a> · <a href="CONTRIBUTING.zh-CN.md">简体中文</a> · <a href="CONTRIBUTING.ja-JP.md">日本語</a></p>
+<p align="center"><b>English</b> · <a href="CONTRIBUTING.pt-BR.md">Português (Brasil)</a> · <a href="CONTRIBUTING.de.md">Deutsch</a> · <a href="CONTRIBUTING.fr.md">Français</a> · <a href="CONTRIBUTING.zh-CN.md">简体中文</a> · <a href="CONTRIBUTING.ja-JP.md">日本語</a></p>
 
 ---
 
@@ -16,7 +16,7 @@ This guide tells you exactly where to look for each type of contribution and wha
 | Make OD speak a new brand's visual language | a **Design System** | [`design-systems/<brand>/DESIGN.md`](design-systems/) | one Markdown file |
 | Hook up a new coding-agent CLI | an **Agent adapter** | [`apps/daemon/src/agents.ts`](apps/daemon/src/agents.ts) | ~10 lines in one array |
 | Add a feature, fix a bug, lift a UX pattern from [`open-codesign`][ocod] | code | `apps/web/src/`, `apps/daemon/` | normal PR |
-| Improve docs, port a section to Deutsch / 中文, fix typos | docs | `README.md`, `README.de.md`, `README.zh-CN.md`, `docs/`, `QUICKSTART.md` | one PR |
+| Improve docs, port a section to Français / Deutsch / 中文, fix typos | docs | `README.md`, `README.fr.md`, `README.de.md`, `README.zh-CN.md`, `docs/`, `QUICKSTART.md` | one PR |
 
 If you're not sure which bucket your idea is in, [open a discussion / issue first](https://github.com/nexu-io/open-design/issues/new) and we'll point you at the right surface.
 
@@ -33,12 +33,69 @@ corepack enable           # selects the pinned pnpm from packageManager
 pnpm install
 pnpm tools-dev run web    # daemon + web foreground loop
 pnpm typecheck            # tsc -b --noEmit
-pnpm build                # production build
+pnpm --filter @open-design/web build  # web package build when needed
 ```
 
 Node `~24` and pnpm `10.33.x` are required. `nvm` / `fnm` are optional; use `nvm install 24 && nvm use 24` or `fnm install 24 && fnm use 24` if you prefer managing Node that way. macOS, Linux, and WSL2 are the primary paths. Windows native should work but isn't a primary target — file an issue if it doesn't.
 
-You don't need any agent CLI on your `PATH` to develop OD itself — the daemon will tell you "no agents found" and fall back to the **Anthropic API · BYOK** path, which is the fastest dev loop anyway.
+## Docker Setup
+
+Run Open Design without installing Node.js or pnpm.
+
+### Prerequisites
+
+Make sure Docker Desktop with Compose v2 is installed:
+
+```bash
+docker compose version
+```
+
+### Start Open Design
+
+```bash
+cd deploy
+docker compose up -d
+```
+
+Open in your browser:
+
+```text
+http://localhost:7456
+```
+
+### Common Commands
+
+```bash
+# View logs
+docker compose logs -f
+
+# Restart containers
+docker compose restart
+
+# Stop containers
+docker compose down
+
+# Pull latest image
+docker compose pull
+docker compose up -d
+```
+
+### Optional Environment Overrides
+
+Create a `deploy/.env` file:
+
+```env
+OPEN_DESIGN_PORT=7456
+OPEN_DESIGN_MEM_LIMIT=384m
+OPEN_DESIGN_ALLOWED_ORIGINS=https://yourdomain.com
+OPEN_DESIGN_IMAGE=docker.io/vanjayak/open-design:latest
+```
+
+> Projects and database data are persisted automatically using Docker volumes.
+
+For the full Docker guide and advanced configuration, see `QUICKSTART.md`.
+
+
 
 ---
 
@@ -46,74 +103,19 @@ You don't need any agent CLI on your `PATH` to develop OD itself — the daemon 
 
 A skill is a folder under [`skills/`](skills/) with a `SKILL.md` at the root, following Claude Code's [`SKILL.md` convention][skill] plus our optional `od:` extension. **No registration step.** Drop the folder in, restart the daemon, the picker shows it.
 
-### Skill folder layout
+### → See [`docs/skills-contributing.md`](docs/skills-contributing.md) for the full guide
 
-```text
-skills/your-skill/
-├── SKILL.md                    # required
-├── assets/template.html        # optional but recommended — the seed file
-├── references/                 # optional — knowledge files the agent reads
-│   ├── layouts.md
-│   ├── components.md
-│   └── checklist.md
-└── example.html                # strongly recommended — a real, hand-built sample
-```
+That file walks through:
 
-### `SKILL.md` frontmatter
+- **Quick start** — clone → copy a closest existing skill → run `pnpm tools-dev run web` → see the picker → open PR.
+- **What a skill IS / IS NOT** — saves you a week if your idea turns out to be a feature or vendor integration in disguise.
+- **Skill anatomy** — minimum folder layout and `SKILL.md` frontmatter cheat sheet.
+- **Running locally** — the four commands that actually matter.
+- **Merge bar** — copy-pasteable checklist of every thing a reviewer will check.
+- **PR description template** — drop into your PR body and fill in.
+- **Common rejection patterns** — the close reasons we've used recently, with concrete examples.
 
-The first three keys are the Claude Code base spec — `name`, `description`, `triggers`. Everything under `od:` is OD-specific and optional, but **`od.mode`** decides which group the skill shows up in (Prototype / Deck / Template / Design system).
-
-```yaml
----
-name: your-skill
-description: |
-  One-paragraph elevator pitch. The agent reads this verbatim to decide
-  if the user's brief matches. Be concrete: surface, audience, what's in
-  the artifact, what's not.
-triggers:
-  - "your trigger phrase"
-  - "another phrase"
-  - "中文触发词"
-od:
-  mode: prototype           # prototype | deck | template | design-system
-  platform: desktop         # desktop | mobile
-  scenario: marketing       # free-form tag for grouping
-  featured: 1               # any positive integer surfaces it under "Showcase examples"
-  preview:
-    type: html              # html | jsx | pptx | markdown
-    entry: index.html
-  design_system:
-    requires: true          # does the skill read the active DESIGN.md?
-    sections: [color, typography, layout, components]
-  example_prompt: "A copy-pastable prompt that nicely shows what this skill does."
----
-
-# Your Skill
-
-Body is free-form Markdown describing the workflow the agent should follow…
-```
-
-The full grammar — typed inputs, slider parameters, capability gating — lives in [`docs/skills-protocol.md`](docs/skills-protocol.md).
-
-### Bar for merging a new skill
-
-We're picky about skills because they're the user-facing surface. A new skill must:
-
-1. **Ship a real `example.html`.** Hand-built, opens straight from disk, looks like something a designer would actually deliver. No lorem ipsum, no `<svg><rect/></svg>` placeholder hero. If you can't build the example yourself, the skill probably isn't ready.
-2. **Pass the anti-AI-slop checklist** in the body. No purple gradients, no generic emoji icons, no rounded card with a left-border accent, no Inter as a *display* face, no invented stats. Read the **Anti-AI-slop machinery** section of the README for the full list.
-3. **Honest placeholders.** When the agent doesn't have a real number, write `—` or a labelled grey block, not "10× faster".
-4. **Have a `references/checklist.md`** with at least P0 gates (the stuff the agent has to pass before emitting `<artifact>`). Lift the format from [`skills/guizang-ppt/references/checklist.md`](skills/guizang-ppt/) or [`skills/dating-web/references/checklist.md`](skills/dating-web/).
-5. **Add a screenshot** at `docs/screenshots/skills/<skill>.png` if the skill is featured. PNG, ~1024×640 retina, captured from the real `example.html` at zoomed-out browser scale.
-6. **Be a single self-contained folder.** No CDN imports beyond what other skills already use; no fonts you didn't license; no images larger than ~250 KB.
-
-If you fork an existing skill (e.g. start from `dating-web` and remix into a `recruiting-web`), keep the original LICENSE and authorship in `references/` and call it out in your PR description.
-
-### Skills that already ship — pick one to imitate
-
-- Visual showcase, single-screen prototype: [`skills/dating-web/`](skills/dating-web/), [`skills/digital-eguide/`](skills/digital-eguide/)
-- Multi-frame mobile flow: [`skills/mobile-onboarding/`](skills/mobile-onboarding/), [`skills/gamified-app/`](skills/gamified-app/)
-- Document / template (no design system required): [`skills/pm-spec/`](skills/pm-spec/), [`skills/weekly-update/`](skills/weekly-update/)
-- Deck mode: [`skills/guizang-ppt/`](skills/guizang-ppt/) (bundled verbatim from [op7418/guizang-ppt-skill][guizang]) and [`skills/simple-deck/`](skills/simple-deck/)
+The protocol spec (full frontmatter grammar — typed inputs, slider parameters, craft references, testing primitives) lives separately in [`docs/skills-protocol.md`](docs/skills-protocol.md).
 
 ---
 
@@ -190,6 +192,28 @@ Bar for merging:
 1. **A real session works end-to-end** with the new agent — paste the daemon log into the PR description showing it streamed an artifact through.
 2. **`docs/agent-adapters.md`** is updated with the CLI's quirks (does it require a key file? does it support image input? what's its non-interactive flag?).
 3. **The README's "Supported coding agents" table** gets one row.
+
+---
+
+## Updating model `max_tokens` metadata
+
+API-mode chat sends `max_tokens` to the upstream provider on every request. The web client picks that number from a three-tier lookup in [`apps/web/src/state/maxTokens.ts`](apps/web/src/state/maxTokens.ts):
+
+1. The user's explicit override in Settings, if set.
+2. Otherwise, the per-model default in [`apps/web/src/state/litellm-models.json`](apps/web/src/state/litellm-models.json) — a vendored slice of [BerriAI/litellm][litellm]'s `model_prices_and_context_window.json` (MIT). It covers ~2k chat models across Anthropic, OpenAI, DeepSeek, Groq, Together, Mistral, Gemini, Bedrock, Vertex, OpenRouter, and friends.
+3. Otherwise, `FALLBACK_MAX_TOKENS = 8192`.
+
+To pick up a newly-launched model, regenerate the vendored JSON:
+
+```bash
+node --experimental-strip-types scripts/sync-litellm-models.ts
+```
+
+The script fetches LiteLLM's catalog, filters to `mode: 'chat'` entries, projects each to its `max_output_tokens` (or `max_tokens` fallback), and writes a sorted snapshot. Commit the regenerated `litellm-models.json` alongside whatever PR triggered the refresh.
+
+The OVERRIDES table in `maxTokens.ts` is for the rare case where LiteLLM is missing or wrong for a model id we actually use — for example, `mimo-v2.5-pro` (LiteLLM only ships MiMo via the `openrouter/xiaomi/...` and `novita/xiaomimimo/...` aliases, neither of which matches the canonical id Xiaomi's direct API uses). Keep it small; everything that LiteLLM gets right belongs upstream.
+
+[litellm]: https://github.com/BerriAI/litellm
 
 ---
 

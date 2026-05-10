@@ -3,10 +3,15 @@ import { useT } from '../i18n';
 import type { Dict } from '../i18n/types';
 import { projectRawUrl } from '../providers/registry';
 import type { TodoItem } from '../runtime/todos';
-import type { ChatAttachment, ChatMessage, Conversation, ProjectFile } from '../types';
+import type { AppConfig, ChatAttachment, ChatCommentAttachment, ChatMessage, Conversation, PreviewComment, ProjectFile, ProjectMetadata } from '../types';
 import { dayKey, dayLabel, exactDateTime, messageTime, relativeTimeLong } from '../utils/chatTime';
+import { commentsToAttachments, simplePositionLabel } from '../comments';
 import { AssistantMessage } from './AssistantMessage';
-import { ChatComposer, type ChatComposerHandle } from './ChatComposer';
+import {
+  ChatComposer,
+  type ChatComposerHandle,
+  type ChatSendMeta,
+} from './ChatComposer';
 import { Icon } from './Icon';
 
 type TranslateFn = (key: keyof Dict, vars?: Record<string, string | number>) => string;
@@ -52,7 +57,12 @@ interface Props {
   // set to decide whether a path can be opened as a tab.
   projectFileNames?: Set<string>;
   onEnsureProject: () => Promise<string | null>;
-  onSend: (prompt: string, attachments: ChatAttachment[]) => void;
+  previewComments?: PreviewComment[];
+  attachedComments?: PreviewComment[];
+  onAttachComment?: (comment: PreviewComment) => void;
+  onDetachComment?: (commentId: string) => void;
+  onDeleteComment?: (commentId: string) => void;
+  onSend: (prompt: string, attachments: ChatAttachment[], commentAttachments: ChatCommentAttachment[], meta?: ChatSendMeta) => void;
   onStop: () => void;
   // Click-to-open chain: passes a basename up to ProjectView, which sets
   // FileWorkspace's openRequest. Tool cards, attachment chips, and
@@ -76,6 +86,19 @@ interface Props {
   // Composer settings/CLI button forwards to here. The dialog lives in App
   // (it owns the AppConfig lifecycle) so we just pass the open trigger.
   onOpenSettings?: () => void;
+  // Same dialog, but landing on the External MCP tab. Forwarded to the
+  // composer's `/mcp` slash and MCP picker button.
+  onOpenMcpSettings?: () => void;
+  // Optional pet wiring forwarded straight through to ChatComposer's
+  // /pet button. When omitted the composer hides the button entirely.
+  petConfig?: AppConfig['pet'];
+  onAdoptPet?: (petId: string) => void;
+  onTogglePet?: () => void;
+  onOpenPetSettings?: () => void;
+  projectMetadata?: ProjectMetadata;
+  onProjectMetadataChange?: (metadata: ProjectMetadata) => void;
+  researchAvailable?: boolean;
+  onCollapse?: () => void;
 }
 
 type Tab = 'chat' | 'comments';
@@ -88,6 +111,11 @@ export function ChatPane({
   projectFiles,
   projectFileNames,
   onEnsureProject,
+  previewComments = [],
+  attachedComments = [],
+  onAttachComment,
+  onDetachComment,
+  onDeleteComment,
   onSend,
   onStop,
   onRequestOpenFile,
@@ -101,12 +129,29 @@ export function ChatPane({
   onDeleteConversation,
   onRenameConversation,
   onOpenSettings,
+  onOpenMcpSettings,
+  petConfig,
+  onAdoptPet,
+  onTogglePet,
+  onOpenPetSettings,
+  projectMetadata,
+  onProjectMetadataChange,
+  researchAvailable,
+  onCollapse,
 }: Props) {
   const t = useT();
   const logRef = useRef<HTMLDivElement | null>(null);
   const historyWrapRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<ChatComposerHandle | null>(null);
   const didInitialScrollRef = useRef(false);
+  // Tracks whether the user is glued close enough to the bottom that
+  // streamed content should auto-follow. Distinct from the jump-button
+  // state below, which uses a wider threshold (120px) so the affordance
+  // stays visible for short scroll-ups. Auto-follow needs the tighter
+  // 80px cutoff: scrolling ~90px up is an intentional pause that
+  // shouldn't be yanked back the moment the next chunk streams in.
+  const pinnedToBottomRef = useRef(true);
+  const scrolledToFormRef = useRef<Set<string>>(new Set());
   const [tab, setTab] = useState<Tab>('chat');
   const [showConvList, setShowConvList] = useState(false);
   const [scrolledFromBottom, setScrolledFromBottom] = useState(false);
@@ -131,6 +176,10 @@ export function ChatPane({
 
   useEffect(() => {
     didInitialScrollRef.current = false;
+    // A new conversation should land at the bottom (its own initial
+    // scroll), not inherit the previous conversation's saved position.
+    savedChatScrollRef.current = null;
+    scrolledToFormRef.current = new Set();
   }, [activeConversationId]);
 
   useEffect(() => {
@@ -138,36 +187,146 @@ export function ChatPane({
     if (!el || didInitialScrollRef.current || messages.length === 0) return;
     didInitialScrollRef.current = true;
     requestAnimationFrame(() => {
+      // If the last assistant message contains a question form, scroll to
+      // the form instead of the bottom, so the user sees the form first.
+      const lastAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
+      if (lastAssistantMsg?.content.includes('<question-form')) {
+        const assistantEls = el.querySelectorAll('.msg.assistant');
+        const lastAssistantEl = assistantEls[assistantEls.length - 1];
+        const formEl = lastAssistantEl?.querySelector<HTMLElement>('[data-form-id]');
+        if (formEl && !scrolledToFormRef.current.has(formEl.dataset.formId!)) {
+          scrolledToFormRef.current.add(formEl.dataset.formId!);
+          formEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
+          pinnedToBottomRef.current = false;
+          setScrolledFromBottom(true);
+          return;
+        }
+        // Already handled by the auto-scroll effect — don't bottom-scroll.
+        if (formEl) return;
+      }
+      // Initial-load bottom-pin must be instant — smooth scrollTo emits
+      // intermediate scroll events that flip pinnedToBottomRef to false.
       el.scrollTop = el.scrollHeight;
       setScrolledFromBottom(false);
+      pinnedToBottomRef.current = true;
     });
-  }, [activeConversationId, messages.length]);
+    // `tab` is in the deps so that switching conversations while
+    // Comments is open doesn't strand the new conversation at scrollTop:
+    // 0. The activeConversationId-reset effect above clears
+    // didInitialScrollRef while the chat-log is unmounted; this effect
+    // then re-runs when the user returns to Chat and the element is
+    // available, scrolling the new conversation to its initial bottom.
+  }, [activeConversationId, messages.length, tab]);
 
   useEffect(() => {
     const el = logRef.current;
     if (!el) return;
-    // Auto-scroll only when we're already pinned near the bottom — preserves
-    // a user's scrollback position when they're reading earlier output while
-    // a new turn streams in.
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distance < 80) {
+    // Auto-scroll only when the user was already pinned near the bottom,
+    // so a scrollback session reading earlier output isn't yanked to the
+    // latest message. We key off the pre-content `pinnedToBottomRef`
+    // (a ref so it doesn't itself re-fire this effect on scroll) instead
+    // of recomputing distance from the just-grown scrollHeight: a single
+    // streamed chunk can add 100+ px in one render, which made the
+    // post-content distance check skip auto-scroll even when the user
+    // was glued to the bottom. We deliberately use the tighter 80px
+    // cutoff tracked by the ref (not the wider 120px jump-button
+    // threshold) so a deliberate ~90px scroll-up isn't snapped back the
+    // next time content streams in. Issue #983.
+    if (pinnedToBottomRef.current) {
+      // If the last assistant message contains a question form, scroll to
+      // the form instead of the bottom, so the user lands on the form.
+      const lastAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
+      if (lastAssistantMsg?.content.includes('<question-form')) {
+        const assistantEls = el.querySelectorAll('.msg.assistant');
+        const lastAssistantEl = assistantEls[assistantEls.length - 1];
+        const formEl = lastAssistantEl?.querySelector<HTMLElement>('[data-form-id]');
+        if (formEl && !scrolledToFormRef.current.has(formEl.dataset.formId!)) {
+          scrolledToFormRef.current.add(formEl.dataset.formId!);
+          formEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
+          pinnedToBottomRef.current = false;
+          setScrolledFromBottom(true);
+          return;
+        }
+        // Form tag in content but the DOM element isn't ready yet (partial
+        // stream) — skip bottom-scroll to avoid a jarring jump that gets
+        // undone when the form finishes rendering.
+        if (streaming) return;
+      }
+      // Streaming bottom-pin must be instant — smooth scrollTo emits
+      // intermediate scroll events that flip pinnedToBottomRef to false,
+      // breaking auto-follow for subsequent chunks.
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages, error]);
+  }, [messages, error, streaming]);
 
+  // Saved chat-log scroll state, preserved across tab switches. The
+  // chat-log <div> is conditionally rendered so it unmounts when the
+  // user switches to Comments. On remount it would default to
+  // scrollTop: 0 and the initial-bottom-scroll effect skips because
+  // didInitialScrollRef is already true. We capture either the absolute
+  // scrollTop or a "pinned to bottom" flag while Chat is visible, so
+  // bottom-followers stay pinned even when new messages stream in
+  // off-tab. Issue #790.
+  const savedChatScrollRef = useRef<
+    { pinnedToBottom: true } | { pinnedToBottom: false; scrollTop: number } | null
+  >(null);
   useEffect(() => {
+    if (tab !== 'chat') return;
     const el = logRef.current;
     if (!el) return;
+
+    // Restore previously-saved position on remount. Defer to the next
+    // frame so the conditional <> contents finish layout before the
+    // scrollTop write lands.
+    const saved = savedChatScrollRef.current;
+    if (saved !== null) {
+      requestAnimationFrame(() => {
+        const target = logRef.current;
+        if (!target) return;
+        if (saved.pinnedToBottom) {
+          target.scrollTop = target.scrollHeight;
+        } else {
+          target.scrollTop = saved.scrollTop;
+        }
+        // Resync the jump-to-latest affordance with the restored
+        // position. Without this, a user who left Chat ~60px from the
+        // bottom and returns to find new messages stacked underneath
+        // would land hundreds of pixels above the latest turn while
+        // scrolledFromBottom remained false until they scrolled.
+        const distance =
+          target.scrollHeight - target.scrollTop - target.clientHeight;
+        setScrolledFromBottom(distance > 120);
+        pinnedToBottomRef.current = distance < 80;
+      });
+    }
+
+    function snapshot(target: HTMLDivElement) {
+      const distance =
+        target.scrollHeight - target.scrollTop - target.clientHeight;
+      savedChatScrollRef.current =
+        distance < 50
+          ? { pinnedToBottom: true }
+          : { pinnedToBottom: false, scrollTop: target.scrollTop };
+    }
+
     function onScroll() {
       const target = logRef.current;
       if (!target) return;
+      snapshot(target);
       const distance =
         target.scrollHeight - target.scrollTop - target.clientHeight;
       setScrolledFromBottom(distance > 120);
+      pinnedToBottomRef.current = distance < 80;
     }
     el.addEventListener('scroll', onScroll);
-    return () => el.removeEventListener('scroll', onScroll);
-  }, []);
+    return () => {
+      // Capture final scroll state before unmount; the ref normally
+      // tracks via onScroll, but programmatic scrolls or layout shifts
+      // right before unmount can leave it stale.
+      snapshot(el);
+      el.removeEventListener('scroll', onScroll);
+    };
+  }, [tab]);
 
   // Close the conversation history dropdown on outside click / Escape.
   useEffect(() => {
@@ -213,11 +372,9 @@ export function ChatPane({
           <button
             type="button"
             role="tab"
-            aria-selected={false}
-            className="chat-header-tab"
-            disabled
-            title={t('chat.commentsSoon')}
-            data-coming-soon="true"
+            aria-selected={tab === 'comments'}
+            className={`chat-header-tab${tab === 'comments' ? ' active' : ''}`}
+            onClick={() => setTab('comments')}
           >
             {t('chat.tabComments')}
           </button>
@@ -303,6 +460,18 @@ export function ChatPane({
           >
             <Icon name="plus" size={16} />
           </button>
+          {onCollapse ? (
+            <button
+              type="button"
+              className="icon-only"
+              data-testid="chat-collapse"
+              title={t('workspace.focusMode')}
+              aria-label={t('workspace.focusMode')}
+              onClick={onCollapse}
+            >
+              <Icon name="chevron-left" size={15} />
+            </button>
+          ) : null}
         </div>
       </div>
       {tab === 'chat' ? (
@@ -378,7 +547,11 @@ export function ChatPane({
                         onRequestOpenFile={onRequestOpenFile}
                         isLast={m.id === lastAssistantId}
                         nextUserContent={nextUserContentByAssistantId.get(m.id)}
-                        onSubmitForm={onSubmitForm}
+                        onSubmitForm={(text) => {
+                          pinnedToBottomRef.current = true;
+                          scrolledToFormRef.current = new Set();
+                          onSubmitForm?.(text);
+                        }}
                         onContinueRemainingTasks={
                           m.id === lastAssistantId && onContinueRemainingTasks
                             ? (todos) => onContinueRemainingTasks(m, todos)
@@ -410,13 +583,150 @@ export function ChatPane({
             streaming={streaming || hasActiveRunMessage}
             initialDraft={initialDraft}
             onEnsureProject={onEnsureProject}
-            onSend={onSend}
+            commentAttachments={commentsToAttachments(attachedComments)}
+            onRemoveCommentAttachment={onDetachComment}
+            onSend={(prompt, attachments, commentAttachments, meta) => {
+              pinnedToBottomRef.current = true;
+              scrolledToFormRef.current = new Set();
+              onSend(prompt, attachments, commentAttachments, meta);
+            }}
             onStop={onStop}
             onOpenSettings={onOpenSettings}
+            onOpenMcpSettings={onOpenMcpSettings}
+            petConfig={petConfig}
+            onAdoptPet={onAdoptPet}
+            onTogglePet={onTogglePet}
+            onOpenPetSettings={onOpenPetSettings}
+            researchAvailable={researchAvailable}
+            projectMetadata={projectMetadata}
+            onProjectMetadataChange={onProjectMetadataChange}
           />
         </>
       ) : null}
+      {tab === 'comments' ? (
+        <CommentsPanel
+          comments={previewComments}
+          attachedComments={attachedComments}
+          onAttach={onAttachComment}
+          onDetach={onDetachComment}
+          onDelete={onDeleteComment}
+          t={t}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function CommentsPanel({
+  comments,
+  attachedComments,
+  onAttach,
+  onDetach,
+  onDelete,
+  t,
+}: {
+  comments: PreviewComment[];
+  attachedComments: PreviewComment[];
+  onAttach?: (comment: PreviewComment) => void;
+  onDetach?: (commentId: string) => void;
+  onDelete?: (commentId: string) => void;
+  t: TranslateFn;
+}) {
+  const attachedIds = new Set(attachedComments.map((comment) => comment.id));
+  const saved = comments.filter((comment) => !attachedIds.has(comment.id));
+  return (
+    <div className="comments-panel" data-testid="comments-panel">
+      <CommentSection
+        title={t('chat.comments.attached')}
+        empty={t('chat.comments.emptyAttached')}
+        comments={attachedComments}
+        actionLabel={t('chat.comments.remove')}
+        onAction={(comment) => onDetach?.(comment.id)}
+        attached
+      />
+      <CommentSection
+        title={t('chat.comments.saved')}
+        empty={t('chat.comments.emptySaved')}
+        comments={saved}
+        actionLabel={t('chat.comments.add')}
+        onAction={(comment) => onAttach?.(comment)}
+        secondaryActionLabel={t('chat.comments.remove')}
+        onSecondaryAction={(comment) => onDelete?.(comment.id)}
+      />
+      {saved.length > 0 ? (
+        <div className="comments-footer">
+          <button
+            type="button"
+            className="primary"
+            onClick={() => saved.forEach((comment) => onAttach?.(comment))}
+          >
+            {t('chat.comments.addAll')}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CommentSection({
+  title,
+  empty,
+  comments,
+  actionLabel,
+  onAction,
+  secondaryActionLabel,
+  onSecondaryAction,
+  attached,
+}: {
+  title: string;
+  empty: string;
+  comments: PreviewComment[];
+  actionLabel: string;
+  onAction: (comment: PreviewComment) => void;
+  secondaryActionLabel?: string;
+  onSecondaryAction?: (comment: PreviewComment) => void;
+  attached?: boolean;
+}) {
+  return (
+    <section className="comments-section">
+      <h3>{title}</h3>
+      {comments.length === 0 ? (
+        <p className="comments-empty">{empty}</p>
+      ) : (
+        comments.map((comment) => (
+          <article
+            key={comment.id}
+            className={`comment-card${attached ? ' attached' : ''}`}
+            data-testid={`comment-card-${comment.elementId}`}
+          >
+            <div className="comment-card-top">
+              <strong>{comment.elementId}</strong>
+              <div className="comment-card-actions">
+                {secondaryActionLabel && onSecondaryAction ? (
+                  <button
+                    type="button"
+                    className="comment-card-action danger"
+                    onClick={() => onSecondaryAction(comment)}
+                  >
+                    {secondaryActionLabel}
+                  </button>
+                ) : null}
+                <button type="button" className="comment-card-action" onClick={() => onAction(comment)}>
+                  {actionLabel}
+                </button>
+              </div>
+            </div>
+            <p>{comment.note}</p>
+            <div className="comment-card-meta">
+              <span>{comment.id}</span>
+              <span>{comment.filePath}</span>
+              <span>{comment.label}</span>
+              <span>{simplePositionLabel(comment.position)}</span>
+            </div>
+          </article>
+        ))
+      )}
+    </section>
   );
 }
 
@@ -519,6 +829,7 @@ function UserMessage({
   t: TranslateFn;
 }) {
   const attachments = message.attachments ?? [];
+  const commentAttachments = message.commentAttachments ?? [];
   return (
     <div className="msg user">
       <div className="role">
@@ -555,7 +866,19 @@ function UserMessage({
           })}
         </div>
       ) : null}
-      <div className="user-text">{message.content}</div>
+      {commentAttachments.length > 0 ? (
+        <div className="user-attachments comment-history-attachments">
+          {commentAttachments.map((a) => (
+            <span key={a.id} className="user-attachment staged-comment">
+              <span className="staged-name">
+                <strong>{a.elementId}</strong>
+                <span>{a.comment}</span>
+              </span>
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {message.content ? <div className="user-text">{message.content}</div> : null}
     </div>
   );
 }
